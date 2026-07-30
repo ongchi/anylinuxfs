@@ -377,6 +377,13 @@ pub(crate) fn load_mount_config(cmd: MountCmd) -> anyhow::Result<MountConfig> {
                         );
                     }
                 }
+
+                host_eprintln!(
+                    "warning: binding to {} exposes this share beyond the local machine. \
+                     NFS access is unauthenticated and the default export options grant \
+                     remote root write access to the disk.",
+                    bind_addr
+                );
             }
 
             Some(bind_addr)

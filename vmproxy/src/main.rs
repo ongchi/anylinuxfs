@@ -20,6 +20,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 #[cfg(any(target_os = "freebsd", target_os = "macos"))]
 use std::net::TcpListener;
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -522,6 +523,59 @@ fn statfs(path: impl AsRef<Path>) -> io::Result<libc::statfs> {
         return Err(io::Error::last_os_error());
     }
     Ok(buf)
+}
+
+/// The host's address as seen from inside the VM.
+///
+/// Mirrors the gateway derivation in `init_network`: under vmnet the host holds
+/// the first host address of the native network, and under gvproxy/TSI it is the
+/// fixed `VM_GATEWAY_IP`.
+fn host_peer_ip(native_network: Option<Ipv4Net>) -> anyhow::Result<Ipv4Addr> {
+    match native_network.and_then(|net| net.hosts().next()) {
+        Some(addr) => Ok(addr),
+        None => VM_GATEWAY_IP
+            .parse()
+            .context("Failed to parse VM_GATEWAY_IP"),
+    }
+}
+
+/// Which peer the NFS exports should be restricted to.
+///
+/// Normally this is just the host. When the user asked for the share to be
+/// reachable off-box (`--bind-addr` with a non-loopback address) the clients are
+/// arbitrary remote machines, so the export has to stay open — the host warns
+/// about that separately.
+fn nfs_export_peer(
+    bind_addrs: &[String],
+    native_network: Option<Ipv4Net>,
+) -> anyhow::Result<String> {
+    let shared_volume = bind_addrs.iter().any(|addr| {
+        addr.parse::<IpAddr>()
+            .map(|addr| !addr.is_loopback())
+            .unwrap_or(false)
+    });
+
+    if shared_volume {
+        return Ok("*".to_owned());
+    }
+
+    Ok(host_peer_ip(native_network)?.to_string())
+}
+
+/// Reject export paths that can't safely be written to a line-based exports
+/// file. The paths come from the mounted filesystem (ZFS dataset mountpoints),
+/// so a crafted pool could otherwise append arbitrary export entries.
+fn validate_export_path(path: &str) -> anyhow::Result<()> {
+    if !path.starts_with('/') {
+        anyhow::bail!("export path {path:?} is not absolute");
+    }
+    if let Some(c) = path.chars().find(|c| c.is_control()) {
+        anyhow::bail!("export path {path:?} contains control character {c:?}");
+    }
+    if path.contains('"') {
+        anyhow::bail!("export path {path:?} contains a quote character");
+    }
+    Ok(())
 }
 
 fn export_args_for_path(
@@ -1044,6 +1098,7 @@ impl VmDiskContext {
         export_paths: Vec<String>,
         export_mode: &str,
         effective_export_args_override: Option<&str>,
+        export_peer: &str,
     ) -> anyhow::Result<()> {
         let all_exports = if self.is_zfs {
             let mut paths: BTreeSet<_> = self
@@ -1075,14 +1130,28 @@ impl VmDiskContext {
         let mut exports_content = String::new();
 
         for (export_path, export_args) in &all_exports {
+            if let Err(e) = validate_export_path(export_path) {
+                eprintln!("warning: skipping NFS export: {e:#}");
+                continue;
+            }
             println!("<anylinuxfs-nfs-export:{}>", export_path);
             #[cfg(target_os = "linux")]
             {
-                exports_content += &format!("\"{}\"      *({})\n", export_path, export_args);
+                exports_content += &format!(
+                    "\"{}\"      {}({})\n",
+                    export_path, export_peer, export_args
+                );
             }
             #[cfg(any(target_os = "freebsd", target_os = "macos"))]
             {
-                exports_content += &format!("{} {},network 0.0.0.0/0\n", export_path, export_args);
+                // A bare peer is a host entry; the wildcard has to stay in
+                // -network form, which is what the shared-volume case wants.
+                let peer_spec = if export_peer == "*" {
+                    ",network 0.0.0.0/0".to_owned()
+                } else {
+                    format!(" {export_peer}")
+                };
+                exports_content += &format!("{} {}{}\n", export_path, export_args, peer_spec);
             }
         }
 
@@ -1330,7 +1399,15 @@ fn run() -> anyhow::Result<()> {
         export_args_override
     };
 
-    dsk.build_nfs_exports(export_paths, export_mode, effective_export_args_override)?;
+    let export_peer = nfs_export_peer(&cli.bind_addrs, cli.native_network)?;
+    println!("NFS export peer: {export_peer}");
+
+    dsk.build_nfs_exports(
+        export_paths,
+        export_mode,
+        effective_export_args_override,
+        &export_peer,
+    )?;
 
     match Command::new("/usr/local/bin/entrypoint.sh").spawn() {
         Ok(mut hnd) => {
@@ -1347,6 +1424,54 @@ fn run() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod export_peer_tests {
+    use super::*;
+
+    fn net(s: &str) -> Option<Ipv4Net> {
+        Some(s.parse().unwrap())
+    }
+
+    #[test]
+    fn test_peer_defaults_to_vm_gateway_without_native_network() {
+        assert_eq!(nfs_export_peer(&[], None).unwrap(), VM_GATEWAY_IP);
+    }
+
+    #[test]
+    fn test_peer_is_first_host_of_native_network() {
+        // vmnet hands out a /30: .1 is the host, .2 is the VM.
+        assert_eq!(
+            nfs_export_peer(&[], net("192.168.140.0/30")).unwrap(),
+            "192.168.140.1"
+        );
+    }
+
+    #[test]
+    fn test_loopback_bind_addrs_do_not_widen_the_peer() {
+        let addrs = vec!["127.0.0.1".to_owned(), "127.0.0.44".to_owned()];
+        assert_eq!(nfs_export_peer(&addrs, None).unwrap(), VM_GATEWAY_IP);
+    }
+
+    #[test]
+    fn test_non_loopback_bind_addr_opens_the_export() {
+        let addrs = vec!["127.0.0.1".to_owned(), "192.168.1.50".to_owned()];
+        assert_eq!(nfs_export_peer(&addrs, None).unwrap(), "*");
+    }
+
+    #[test]
+    fn test_validate_export_path_accepts_ordinary_mountpoints() {
+        assert!(validate_export_path("/mnt/tank/data").is_ok());
+    }
+
+    #[test]
+    fn test_validate_export_path_rejects_injection_attempts() {
+        // A ZFS mountpoint carrying a quote could append its own export entry.
+        assert!(validate_export_path("/mnt/x\" *(rw,no_root_squash) #").is_err());
+        assert!(validate_export_path("/mnt/x\n/etc *(rw)").is_err());
+        assert!(validate_export_path("relative/path").is_err());
+    }
 }
 
 #[cfg(test)]

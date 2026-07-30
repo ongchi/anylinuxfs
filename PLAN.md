@@ -183,6 +183,44 @@ rather than a malformed exports file; `--bind-addr` on a LAN IP prints the warni
 4. Manual: confirm an unprivileged local NFS client can no longer reach the export
    (subject to the step 2.3 outcome).
 
+## Status
+
+- Fix #1 (1.1–1.4): **done**, verified by `cargo check -F freebsd` and the full
+  unit suite.
+- Fix #2 steps 2.1, 2.2, 2.4: **done**. Implemented entirely guest-side — vmproxy
+  already receives the vmnet CIDR (`-n/--native-network`) and the bind addresses,
+  so the peer is derived there and no new host→guest plumbing was needed. Both
+  the Linux and BSD/macOS export-line branches were type-checked.
+- Fix #2 step 2.3 (`insecure`): **open**, blocked on a probe that needs an
+  interactive sudo password. See below.
+
+### Open question for step 2.3
+
+Under gvproxy the guest asks the host to forward `{bind_addr}:2049` to
+`{VM_IP}:2049` (`vmproxy/src/main.rs`, `init_network`). gvproxy accepts on the
+host and re-dials inside its own netstack, so the connection the guest's nfsd
+sees is very likely sourced from the gateway on an *ephemeral* port. If that
+holds:
+
+- `insecure` is load-bearing under gvproxy and cannot be dropped, and
+- peer restriction alone does not stop a local unprivileged process there,
+  because its traffic is NAT'd to the same gateway address as the legitimate
+  client.
+
+Under vmnet-helper there is no NAT, so peer restriction is a genuine fix and
+`insecure` should be droppable.
+
+To settle it, mount a volume and inspect the peer address and source port the
+guest sees:
+
+```bash
+sudo anylinuxfs mount /dev/diskN   # in one terminal
+anylinuxfs shell -- ss -tn 'sport = :2049'
+```
+
+A source port <1024 means `insecure` can be dropped; >=1024 means it must stay.
+Repeat with `--net-helper vmnet` to compare.
+
 ## Risks
 
 - Step 2.1/2.3 can break mounting if the peer or port assumptions are wrong for a
