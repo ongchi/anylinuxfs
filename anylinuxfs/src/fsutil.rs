@@ -1,5 +1,5 @@
 use anyhow::Context;
-use bstr::{B, BStr, BString, ByteSlice};
+use bstr::{BStr, BString, ByteSlice};
 use common_utils::{PathExt, host_eprintln, host_println};
 use derive_more::{Deref, DerefMut};
 use rayon::prelude::*;
@@ -318,24 +318,26 @@ fn parallel_mount_recursive(
     elevate: bool,
 ) -> anyhow::Result<()> {
     if let Some((rel_path, nfs_path)) = &trie.paths {
-        let shell_script = [
-            b"mount -t nfs -o ",
-            nfs_opts.as_bytes(),
-            b" \"",
-            vm_host,
-            b":",
-            nfs_path.as_bytes(),
-            b"\" \"",
-            mnt_point_base.join(rel_path).as_bytes(),
-            b"\"",
-        ]
-        .concat();
-        // host_println!("Running NFS mount command: `{}`", &shell_script);
+        // `nfs_path` originates on the mounted disk (e.g. ZFS dataset mountpoints)
+        // and `rel_path` derives from its label, so neither may be interpolated
+        // into a shell command. Pass them as argv instead.
+        let source = [vm_host, b":", nfs_path.as_bytes()].concat();
+        let target = mnt_point_base.join(rel_path);
 
         // elevate if needed (e.g. mounting image under /Volumes)
-        let cmdline = [B("sudo"), B("-S"), B("sh"), B("-c"), &shell_script].map(OsStr::from_bytes);
-        let cmdline = if elevate { &cmdline[..] } else { &cmdline[2..] };
-        let status = Command::new(cmdline[0]).args(&cmdline[1..]).status()?;
+        let mut cmd = if elevate {
+            let mut cmd = Command::new("sudo");
+            cmd.args([OsStr::new("-S"), OsStr::new("mount")]);
+            cmd
+        } else {
+            Command::new("mount")
+        };
+        cmd.args([OsStr::new("-t"), OsStr::new("nfs"), OsStr::new("-o")])
+            .arg(OsStr::from_bytes(nfs_opts.as_bytes()))
+            .arg(OsStr::from_bytes(&source))
+            .arg(&target);
+
+        let status = cmd.status()?;
 
         if !status.success() {
             anyhow::bail!(
@@ -394,12 +396,18 @@ fn parallel_unmount_recursive(trie: &dirtrie::Node) -> anyhow::Result<()> {
         .try_for_each(|(_, child)| parallel_unmount_recursive(child))?;
 
     if let Some((_, mount_path)) = &trie.paths {
+        // Same as parallel_mount_recursive: `mount_path` is disk-controlled, so it
+        // goes through argv rather than a shell string.
         #[cfg(target_os = "macos")]
-        let shell_script = format!("diskutil unmount \"{}\"", mount_path);
+        let (prog, leading_args): (&str, &[&str]) = ("diskutil", &["unmount"]);
         #[cfg(target_os = "linux")]
-        let shell_script = format!("umount \"{}\"", mount_path);
+        let (prog, leading_args): (&str, &[&str]) = ("umount", &[]);
+
         // exit status ignored, we don't want to exit early if one unmount fails
-        let _ = Command::new("sh").arg("-c").arg(&shell_script).status()?;
+        let _ = Command::new(prog)
+            .args(leading_args)
+            .arg(OsStr::from_bytes(mount_path.as_bytes()))
+            .status()?;
     }
     Ok(())
 }

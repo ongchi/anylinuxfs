@@ -117,6 +117,32 @@ pub(crate) fn parse_vm_tag_value(line: &str) -> Option<&str> {
     })
 }
 
+/// Reject NFS export paths reported by the guest that aren't plausible mount
+/// points.
+///
+/// These paths come from the mounted filesystem itself (ZFS dataset mountpoints,
+/// for instance), so they are attacker-controlled. They are consumed by a
+/// line-based marker protocol on the host and written to a line-based exports
+/// file in the guest, which is why control characters are refused outright.
+pub(crate) fn validate_guest_export_path(path: &str) -> anyhow::Result<()> {
+    if path.is_empty() {
+        anyhow::bail!("path is empty");
+    }
+    if !path.starts_with('/') {
+        anyhow::bail!("path {path:?} is not absolute");
+    }
+    if let Some(c) = path.chars().find(|c| c.is_control()) {
+        anyhow::bail!("path {path:?} contains control character {c:?}");
+    }
+    if path.contains('"') {
+        anyhow::bail!("path {path:?} contains a quote character");
+    }
+    if path.split('/').any(|component| component == "..") {
+        anyhow::bail!("path {path:?} contains a '..' component");
+    }
+    Ok(())
+}
+
 pub(crate) fn is_read_only_set(mount_options: Option<&str>) -> bool {
     if let Some(options) = mount_options {
         options.split(',').any(|opt| opt == "ro")

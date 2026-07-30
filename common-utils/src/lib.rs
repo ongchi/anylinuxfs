@@ -18,14 +18,31 @@ pub const VM_IP: &str = "192.168.127.2";
 pub const VM_CTRL_PORT: u16 = 7350;
 pub const VMNET_PREFIX_LEN: u8 = 30;
 
+/// Turn an on-disk filesystem label into a name usable as a path component.
+///
+/// Labels are fully controlled by whoever created the filesystem, and the result
+/// ends up in mount point paths that are passed to external commands, so this
+/// substitutes everything outside a conservative allowlist instead of denylisting
+/// individual separators. Returns `None` if nothing usable remains.
 pub fn path_safe_label_name(name: &str) -> Option<String> {
-    let name_subst = name
-        .replace("/", "-")
-        .replace(|c| matches!(c, ' ' | ':'), "_");
-    name_subst
+    let name_subst: String = name
         .chars()
-        .position(|c| c != '-')
-        .map(|idx| name_subst[idx..].to_string())
+        .map(|c| match c {
+            '/' => '-',
+            c if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') => c,
+            _ => '_',
+        })
+        .collect();
+
+    let trimmed = name_subst.trim_start_matches('-');
+
+    // A label of "." or ".." survives the allowlist but is not a usable path
+    // component.
+    if trimmed.is_empty() || trimmed.chars().all(|c| c == '.') {
+        return None;
+    }
+
+    Some(trimmed.to_owned())
 }
 
 pub fn wait_for_child(
@@ -355,6 +372,48 @@ mod tests {
         assert!(!is_encrypted_fs("linux_raid_member"));
         assert!(!is_encrypted_fs("zfs_member"));
         assert!(!is_encrypted_fs(""));
+    }
+
+    #[test]
+    fn test_path_safe_label_name_keeps_ordinary_labels() {
+        assert_eq!(path_safe_label_name("Backup"), Some("Backup".to_owned()));
+        assert_eq!(
+            path_safe_label_name("my-disk_2.0"),
+            Some("my-disk_2.0".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_path_safe_label_name_substitutes_separators() {
+        assert_eq!(path_safe_label_name("a/b"), Some("a-b".to_owned()));
+        assert_eq!(path_safe_label_name("My Disk"), Some("My_Disk".to_owned()));
+        assert_eq!(path_safe_label_name("a:b"), Some("a_b".to_owned()));
+    }
+
+    #[test]
+    fn test_path_safe_label_name_strips_shell_metacharacters() {
+        for label in [
+            "x\";touch /tmp/pwned;\"",
+            "$(id > /tmp/x)",
+            "`id`",
+            "a|b&c;d",
+            "a\nb",
+        ] {
+            let safe = path_safe_label_name(label).expect("label should yield a name");
+            assert!(
+                safe.chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.')),
+                "{label:?} produced unsafe name {safe:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_path_safe_label_name_rejects_unusable_labels() {
+        assert_eq!(path_safe_label_name(""), None);
+        assert_eq!(path_safe_label_name("---"), None);
+        assert_eq!(path_safe_label_name("."), None);
+        assert_eq!(path_safe_label_name(".."), None);
     }
 }
 

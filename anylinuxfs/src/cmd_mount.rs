@@ -39,7 +39,8 @@ use crate::utils::{
 use crate::vm::*;
 use crate::{
     ConsoleLogGuard, LOCK_FILE, api, cli::*, diskutil, fsutil, load_mount_config, netutil,
-    parse_vm_tag_value, rand_string, to_exit_code, vm_image, vm_network,
+    parse_vm_tag_value, rand_string, to_exit_code, validate_guest_export_path, vm_image,
+    vm_network,
 };
 use crate::{mdns, rpcbind};
 
@@ -806,7 +807,15 @@ impl PtyReader {
                     changed_to_ro = true;
                 } else if tagged.starts_with("<anylinuxfs-nfs-export") {
                     if let Some(export_path) = parse_vm_tag_value(tagged) {
-                        exports.insert(export_path.to_string());
+                        match validate_guest_export_path(export_path) {
+                            Ok(()) => {
+                                exports.insert(export_path.to_string());
+                            }
+                            Err(e) => host_eprintln!(
+                                "warning: ignoring NFS export path from guest: {:#}",
+                                e
+                            ),
+                        }
                     }
                 } else if tagged.starts_with("<anylinuxfs-passphrase-prompt:start>") {
                     self.vm_pwd_prompt_tx.send(true).unwrap();
