@@ -5,7 +5,7 @@ use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
     io::Write,
-    process::{ExitStatus, Stdio},
+    process::{Command, ExitStatus, Stdio},
 };
 
 use crate::{
@@ -147,13 +147,16 @@ pub fn import_all_zpools(
     mount_point_root: &str,
     read_only: bool,
 ) -> anyhow::Result<(ExitStatus, Vec<Mountpoint>, Vec<String>)> {
-    let opts = if read_only { "-o readonly=on" } else { "" };
-    let res = script(&format!(
-        "zpool import {} -faNR {}",
-        opts, &mount_point_root
-    ))
-    .status()
-    .context("Failed to run zpool import command")?;
+    let mut cmd = Command::new("zpool");
+    cmd.arg("import");
+    if read_only {
+        cmd.args(["-o", "readonly=on"]);
+    }
+    let res = cmd
+        .arg("-faNR")
+        .arg(mount_point_root)
+        .status()
+        .context("Failed to run zpool import command")?;
 
     if !res.success() {
         return Ok((res, Vec::new(), Vec::new()));
@@ -184,7 +187,12 @@ pub fn mount_datasets(
             && mp.encrypted
             && !loaded_pools.contains(&mp.pool)
         {
-            let status = script(&format!("zfs load-key -L file://{} {}", key_file, mp.pool))
+            // mp.pool comes from the imported pool's own metadata, so it is
+            // attacker-controlled and must not reach a shell.
+            let status = Command::new("zfs")
+                .args(["load-key", "-L"])
+                .arg(format!("file://{key_file}"))
+                .arg(&mp.pool)
                 .status()
                 .with_context(|| format!("Failed to load ZFS key for pool {}", mp.pool))?;
             if !status.success() {
@@ -197,12 +205,14 @@ pub fn mount_datasets(
             loaded_pools.insert(mp.pool.clone());
         }
         // println!("Mounting {}", mp.name);
-        let load_key_flag = if loaded_pools.contains(&mp.pool) {
-            ""
-        } else {
-            "-l"
-        };
-        let mut cmd = script(&format!("zfs mount {} {}", load_key_flag, mp.name));
+        let needs_load_key = !loaded_pools.contains(&mp.pool);
+        // Same for mp.name: it is a dataset name read off the disk.
+        let mut cmd = Command::new("zfs");
+        cmd.arg("mount");
+        if needs_load_key {
+            cmd.arg("-l");
+        }
+        cmd.arg(&mp.name);
 
         let status = if let Some(pwd) = env_pwds.get(&(i + 1)) {
             let mut child = cmd.stdin(Stdio::piped()).spawn()?;
