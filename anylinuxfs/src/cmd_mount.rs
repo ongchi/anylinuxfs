@@ -1124,26 +1124,30 @@ impl<'a> NfsShareSetup<'a> {
             }
         };
 
-        let shell_script = [
-            b"mount -t nfs -o ",
-            self.nfs_opts.to_list().as_slice(),
-            b" \"",
-            self.vm_host_b,
-            b":",
-            &self.share_path,
-            b"\" \"",
-            mount_point.as_bytes(),
-            b"\"",
-        ]
-        .concat();
+        // share_path embeds the disk's label (via auto_mount_name), so it must
+        // not be interpolated into a shell command — same reasoning as
+        // fsutil::parallel_mount_recursive. Build the argv directly.
+        let source = [self.vm_host_b, b":", self.share_path.as_slice()].concat();
+        let nfs_opts = self.nfs_opts.to_list();
 
-        let shell_script = OsStr::from_bytes(&shell_script);
-        host_println!("NFS mount command: {}", shell_script.display());
+        let mount_cmd = || {
+            let mut cmd = Command::new("mount");
+            cmd.args([OsStr::new("-t"), OsStr::new("nfs"), OsStr::new("-o")])
+                .arg(OsStr::from_bytes(nfs_opts.as_slice()))
+                .arg(OsStr::from_bytes(&source))
+                .arg(mount_point.as_ref());
+            cmd
+        };
+
+        host_println!(
+            "NFS mount: {} -> {}",
+            OsStr::from_bytes(&source).display(),
+            mount_point.display()
+        );
+
         // try to run mount as regular user first
         // (if that succeeds, umount will work without sudo)
-        let mut status = Command::new("sh")
-            .arg("-c")
-            .arg(shell_script)
+        let mut status = mount_cmd()
             .uid(self.config.common.privilege.invoker_uid)
             .gid(self.config.common.privilege.invoker_gid)
             .stdout(Stdio::null())
@@ -1152,7 +1156,21 @@ impl<'a> NfsShareSetup<'a> {
 
         if !status.success() {
             // otherwise run as root (probably the mount point wasn't accessible)
-            status = Command::new("sh").arg("-c").arg(shell_script).status()?;
+            status = mount_cmd().status()?;
+        }
+
+        // A mount point we created ourselves is dead weight if the mount failed.
+        // The success path registers a deferred cleanup for it, but that never
+        // runs when we bail here, and the leftover directory pushes the next
+        // attempt onto a "-1", "-2", ... suffix.
+        if !status.success() && self.config.custom_mount_point.is_none() {
+            if let Err(e) = fs::remove_dir(mount_point.as_ref()) {
+                host_eprintln!(
+                    "Warning: failed to remove unused mount point {}: {:#}",
+                    mount_point.display(),
+                    e
+                );
+            }
         }
 
         if !status.success() {
@@ -1167,16 +1185,24 @@ impl<'a> NfsShareSetup<'a> {
 
         #[cfg(target_os = "macos")]
         if self.config.open_finder {
-            let mut shell_script =
+            // The sound needs a shell for the volume lookup and backgrounding,
+            // but nothing is interpolated into it. The mount point goes to
+            // `open` as an argument instead, so a disk label cannot reach the
+            // shell.
+            let play_sound =
             br#"afplay /System/Library/Components/CoreAudio.component/Contents/SharedSupport/SystemSounds/system/Volume\ Mount.aif \
-                -v $(awk "BEGIN { print "$(osascript -e "get alert volume of (get volume settings)")"/100 };")"#.to_vec();
-            shell_script.extend_from_slice(b" &! open \"");
-            shell_script.extend_from_slice(mount_point.as_bytes());
-            shell_script.extend_from_slice(b"\"");
-            let shell_script = OsStr::from_bytes(&shell_script);
+                -v $(awk "BEGIN { print "$(osascript -e "get alert volume of (get volume settings)")"/100 };") &"#;
             let _ = Command::new("sh")
                 .arg("-c")
-                .arg(shell_script)
+                .arg(OsStr::from_bytes(play_sound))
+                .uid(self.config.common.privilege.invoker_uid)
+                .gid(self.config.common.privilege.invoker_gid)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+
+            let _ = Command::new("open")
+                .arg(mount_point.as_ref())
                 .uid(self.config.common.privilege.invoker_uid)
                 .gid(self.config.common.privilege.invoker_gid)
                 .stdout(Stdio::null())
