@@ -525,6 +525,13 @@ pub(crate) fn start_vmproxy(
             .into_iter()
             .flat_map(|opts| ["--nfs-export-opts".into(), opts.into()]),
     )
+    .chain(
+        config
+            .nfs_export_peer
+            .as_deref()
+            .into_iter()
+            .flat_map(|peer| ["--nfs-export-peer".into(), peer.into()]),
+    )
     .chain(multi_device.then_some("-m".into()).into_iter())
     .chain(reuse_passphrase.then_some("-r".into()).into_iter())
     .chain(

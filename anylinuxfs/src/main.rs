@@ -335,6 +335,7 @@ pub(crate) fn load_mount_config(cmd: MountCmd) -> anyhow::Result<MountConfig> {
 
     let mut nfs_options = cmd.nfs_options.unwrap_or_default();
     let nfs_export_opts = cmd.nfs_export_opts;
+    let nfs_export_peer = cmd.nfs_export_peer;
     let ignore_permissions = cmd.ignore_permissions;
     if ignore_permissions && !nfs_options.iter().any(|o| o == "noowners") {
         nfs_options.push("noowners".to_owned());
@@ -438,6 +439,7 @@ pub(crate) fn load_mount_config(cmd: MountCmd) -> anyhow::Result<MountConfig> {
         mount_options,
         nfs_options,
         nfs_export_opts,
+        nfs_export_peer,
         ignore_permissions,
         allow_remount,
         vm_hostname,

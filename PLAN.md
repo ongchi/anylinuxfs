@@ -243,6 +243,46 @@ anylinuxfs shell -- ss -tn 'sport = :2049'
 A source port <1024 means `insecure` can be dropped; >=1024 means it must stay.
 Repeat with `--net-helper vmnet` to compare.
 
+## Step 2.1 second attempt (2026-07-31)
+
+The first attempt derived the peer as the first host address of the VM's
+network — the address the guest *routes through* — which is not the address the
+guest *observes* as the connection source. Mounts broke under both helpers.
+
+Now the host observes its own address instead: `host_addr_on_network` scans
+`if_addrs::get_if_addrs()` for an address inside the VM's CIDR and passes the
+result to vmproxy as `--nfs-export-peer`. Restriction applies only when that
+lookup succeeds, so the failure mode is an open export (previous behaviour)
+rather than a broken mount. Under gvproxy there is no such network and no
+restriction is attempted, which matches the finding that NAT makes one
+pointless there.
+
+`--nfs-export-peer` is also exposed on the host CLI, so alternative values can
+be tried without a rebuild; `--nfs-export-peer '*'` opts out entirely.
+
+**Unverified on hardware.** Needs a mount with `--net-helper vmnet`; the guest
+log line `NFS export peer: <value>` reports what was applied.
+
+## Deferred: auto-created mount points leak on failed mounts
+
+Not a security issue and pre-existing, but it makes failed mounts pile up
+`/Volumes/<name>-1`, `-2`, ... directories.
+
+`cmd_mount.rs:1048` creates the mount point, but the `deferred` cleanup that
+removes it is only registered at `cmd_mount.rs:1779`, inside the success branch
+(after the `"{} was mounted as {}"` line). A mount that fails after the
+directory exists therefore leaks it, and the uniquifying loop at
+`cmd_mount.rs:1041` picks the next free suffix on the following attempt.
+
+Two candidate fixes:
+
+1. Remove the directory on the error path inside `mount()`. Self-contained, but
+   only covers failures originating in that function.
+2. Pass `Deferred` into `mount()` and register the cleanup immediately after
+   creation, covering every exit path. Correct, but `Deferred<'a>` holds boxed
+   closures and this sits in the privilege drop/re-elevate path, so it needs
+   care.
+
 ## Risks
 
 - Step 2.1/2.3 can break mounting if the peer or port assumptions are wrong for a

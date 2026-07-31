@@ -4,6 +4,7 @@ use common_utils::{
     Deferred, NetHelper, OSType, PathExt, host_eprintln, host_println, ipc, log, safe_println,
     vmctrl,
 };
+use ipnet::Ipv4Net;
 
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
@@ -19,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime};
 use std::{env, iter, thread};
 use std::{
     io::{self, BufRead, BufReader, Write},
-    net::{Ipv4Addr, TcpStream, ToSocketAddrs},
+    net::{IpAddr, Ipv4Addr, TcpStream, ToSocketAddrs},
 };
 
 use crate::devinfo::{DevInfo, DiskFormat};
@@ -571,6 +572,48 @@ pub(crate) struct NetworkEnv {
     pub(crate) usable_loopback_ip: Option<Host>,
     pub(crate) active_vm_hosts: HashSet<String>,
     pub(crate) net_helper: NetHelper,
+}
+
+/// The host's own address on `cidr`, read from the interface list rather than
+/// derived from the subnet layout.
+///
+/// An earlier attempt computed this as the first host address of the VM's
+/// network — the address the guest routes through — which is not the address
+/// the guest observes as the connection source, and it broke mounting. Only an
+/// address actually assigned to one of our interfaces is trustworthy here.
+fn host_addr_on_network(cidr: Ipv4Net) -> Option<Ipv4Addr> {
+    if_addrs::get_if_addrs()
+        .ok()?
+        .into_iter()
+        .find_map(|iface| match iface.ip() {
+            IpAddr::V4(addr) if cidr.contains(&addr) => Some(addr),
+            _ => None,
+        })
+}
+
+/// Which peer the NFS export should be restricted to, or `None` to leave it open.
+///
+/// Restriction is only applied when the host's address on the VM's network can
+/// be positively identified, which in practice means the vmnet helper. Under
+/// gvproxy the VM has no such network: forwarded connections are translated to a
+/// single source address shared by every local client, so a restriction would
+/// exclude nothing while risking a broken mount.
+fn resolve_nfs_export_peer(
+    override_peer: Option<&str>,
+    bind_addr: Option<IpAddr>,
+    host_addr_on_vm_network: Option<Ipv4Addr>,
+) -> Option<String> {
+    if let Some(peer) = override_peer {
+        // Explicit override, including "*" to opt out entirely.
+        return (peer != "*").then(|| peer.to_owned());
+    }
+
+    // Sharing off-box means the clients are arbitrary remote machines.
+    if bind_addr.is_some_and(|addr| !addr.is_loopback()) {
+        return None;
+    }
+
+    host_addr_on_vm_network.map(|addr| addr.to_string())
 }
 
 pub(crate) fn discover_api_sockets() -> anyhow::Result<Vec<PathBuf>> {
@@ -1459,6 +1502,14 @@ impl super::AppRunner {
         };
 
         vm_native_ip = net_helper_svc.vm_native_ip;
+        config.nfs_export_peer = resolve_nfs_export_peer(
+            config.nfs_export_peer.as_deref(),
+            config.bind_addr,
+            net_helper_svc.vm_native_cidr.and_then(host_addr_on_network),
+        );
+        if let Some(peer) = config.nfs_export_peer.as_deref() {
+            host_println!("Restricting NFS export to peer {}", peer);
+        }
         let mut net_helper_proc = net_helper_svc.proc;
 
         let net_helper_pid = net_helper_proc.id() as libc::pid_t;
@@ -1963,5 +2014,62 @@ impl super::AppRunner {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod export_peer_tests {
+    use super::*;
+
+    fn addr(s: &str) -> Ipv4Addr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn test_no_restriction_when_host_address_is_unknown() {
+        // gvproxy: the VM is not on a real subnet, so there is nothing to pin to.
+        assert_eq!(resolve_nfs_export_peer(None, None, None), None);
+    }
+
+    #[test]
+    fn test_restricts_to_observed_host_address() {
+        assert_eq!(
+            resolve_nfs_export_peer(None, None, Some(addr("172.27.1.1"))),
+            Some("172.27.1.1".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_shared_volume_leaves_export_open() {
+        let shared = Some(IpAddr::V4(addr("192.168.1.50")));
+        assert_eq!(
+            resolve_nfs_export_peer(None, shared, Some(addr("172.27.1.1"))),
+            None
+        );
+    }
+
+    #[test]
+    fn test_loopback_bind_addr_keeps_restriction() {
+        let loopback = Some(IpAddr::V4(addr("127.0.0.1")));
+        assert_eq!(
+            resolve_nfs_export_peer(None, loopback, Some(addr("172.27.1.1"))),
+            Some("172.27.1.1".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_override_wins_over_observed_address() {
+        assert_eq!(
+            resolve_nfs_export_peer(Some("10.0.0.9"), None, Some(addr("172.27.1.1"))),
+            Some("10.0.0.9".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_wildcard_override_disables_restriction() {
+        assert_eq!(
+            resolve_nfs_export_peer(Some("*"), None, Some(addr("172.27.1.1"))),
+            None
+        );
     }
 }

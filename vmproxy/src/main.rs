@@ -79,6 +79,11 @@ struct MountArgs {
     key_file: Option<String>,
     #[arg(long = "nfs-export-opts")]
     nfs_export_opts: Option<String>,
+    /// Restrict the NFS export to this peer. Absent means no restriction; the
+    /// host only sets it when it could identify its own address on the VM's
+    /// network.
+    #[arg(long = "nfs-export-peer")]
+    nfs_export_peer: Option<String>,
     #[arg(long = "ignore-permissions")]
     ignore_permissions: bool,
     #[arg(short, long, value_delimiter = ',', num_args = 0..)]
@@ -1064,6 +1069,7 @@ impl VmDiskContext {
         export_paths: Vec<String>,
         export_mode: &str,
         effective_export_args_override: Option<&str>,
+        export_peer: &str,
     ) -> anyhow::Result<()> {
         let all_exports = if self.is_zfs {
             let mut paths: BTreeSet<_> = self
@@ -1100,18 +1106,21 @@ impl VmDiskContext {
                 continue;
             }
             println!("<anylinuxfs-nfs-export:{}>", export_path);
-            // The peer is deliberately left open. Restricting it to the host's
-            // address broke mounting under both network helpers: the source
-            // address nfsd observes is not the gateway address the guest routes
-            // through. Until that address is established on the host side and
-            // passed in, a wildcard is the only value known to work. See PLAN.md.
             #[cfg(target_os = "linux")]
             {
-                exports_content += &format!("\"{}\"      *({})\n", export_path, export_args);
+                exports_content += &format!(
+                    "\"{}\"      {}({})\n",
+                    export_path, export_peer, export_args
+                );
             }
             #[cfg(any(target_os = "freebsd", target_os = "macos"))]
             {
-                exports_content += &format!("{} {},network 0.0.0.0/0\n", export_path, export_args);
+                // A bare address is a host entry; the wildcard needs -network form.
+                let peer_spec = match export_peer {
+                    "*" => ",network 0.0.0.0/0".to_owned(),
+                    peer => format!(" {peer}"),
+                };
+                exports_content += &format!("{} {}{}\n", export_path, export_args, peer_spec);
             }
         }
 
@@ -1359,7 +1368,17 @@ fn run() -> anyhow::Result<()> {
         export_args_override
     };
 
-    dsk.build_nfs_exports(export_paths, export_mode, effective_export_args_override)?;
+    // Absent means the host could not identify a single legitimate client, so
+    // the export has to stay open.
+    let export_peer = cli.nfs_export_peer.as_deref().unwrap_or("*");
+    println!("NFS export peer: {export_peer}");
+
+    dsk.build_nfs_exports(
+        export_paths,
+        export_mode,
+        effective_export_args_override,
+        export_peer,
+    )?;
 
     match Command::new("/usr/local/bin/entrypoint.sh").spawn() {
         Ok(mut hnd) => {

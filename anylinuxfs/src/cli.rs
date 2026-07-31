@@ -139,6 +139,13 @@ pub(crate) struct MountCmd {
     #[clap(verbatim_doc_comment)]
     #[arg(long = "nfs-export-opts")]
     pub nfs_export_opts: Option<String>,
+    /// Restrict the NFS export to this peer ("*" for any).
+    /// Defaults to the host's own address when it can be determined (vmnet),
+    /// otherwise "*". Under gvproxy a restriction has no effect, because
+    /// forwarded connections are translated to a single source address.
+    #[clap(verbatim_doc_comment)]
+    #[arg(long = "nfs-export-peer")]
+    pub nfs_export_peer: Option<String>,
     /// Bypass Unix file permissions: files will appear to be owned by the current host user.
     #[arg(long = "ignore-permissions", conflicts_with = "nfs_export_opts")]
     pub ignore_permissions: bool,
@@ -288,6 +295,7 @@ impl From<ShellCmd> for MountCmd {
             options: None,
             nfs_options: None,
             nfs_export_opts: None,
+            nfs_export_peer: None,
             ignore_permissions: false,
             remount: shell_cmd.remount,
             action: None,

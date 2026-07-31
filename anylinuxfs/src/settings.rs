@@ -846,6 +846,10 @@ pub struct MountConfig {
     pub mount_options: Option<String>,
     pub nfs_options: Vec<String>,
     pub nfs_export_opts: Option<String>,
+    /// Peer the NFS export is restricted to. `None` means no restriction.
+    /// Resolved once the network helper is up, since it depends on the host's
+    /// address on the VM's network.
+    pub nfs_export_peer: Option<String>,
     pub ignore_permissions: bool,
     pub allow_remount: bool,
     pub vm_hostname: String,
