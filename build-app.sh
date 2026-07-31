@@ -16,27 +16,37 @@ cd "$SCRIPT_DIR"
 
 HOST_OS="$(uname -s)"
 
-# On Linux hosts the macOS Homebrew LLVM linker path pinned in
-# vmproxy/.cargo/config.toml doesn't exist, and the -Clinker-plugin-lto flag
-# requires rustc's LLVM version to match the distro clang — typically not the
-# case. Override both via --config (linker, replaces scalar) and RUSTFLAGS env
-# var (rustflags, replaces per-target rustflags per cargo precedence rules).
+# vmproxy/.cargo/config.toml pins the macOS Homebrew LLVM linker path and
+# enables -Clinker-plugin-lto, which requires rustc's LLVM version to match
+# clang's. Neither holds on a Linux host, nor on a macOS host without Homebrew
+# (a nix devshell, say). Override both via --config (linker, replaces scalar)
+# and the RUSTFLAGS env var (replaces per-target rustflags per cargo precedence
+# rules).
+#
+# ANYLINUXFS_CROSS_CC names the clang to cross-compile the guest binaries with;
+# the nix devshell in flake.nix sets it. On Linux the system clang works, so it
+# is the default there. Left empty, the pinned Homebrew path is used unchanged.
+CROSS_CC="${ANYLINUXFS_CROSS_CC:-}"
+if [[ -z "$CROSS_CC" && "$HOST_OS" == "Linux" ]]; then
+    CROSS_CC="clang"
+fi
+
 VMPROXY_LINUX_LINKER_CFG=()
 VMPROXY_BSD_LINKER_CFG=()
 # Empty arrays expand to nothing, so the cargo invocations below run without
-# any env-prefix on macOS (preserving the per-target rustflags from
-# vmproxy/.cargo/config.toml). On Linux we populate them with `env KEY=VAL`
+# any env-prefix (preserving the per-target rustflags from
+# vmproxy/.cargo/config.toml). Otherwise we populate them with `env KEY=VAL`
 # tokens; an array preserves the value as a single argv element through
 # expansion, which a `${VAR:+RUSTFLAGS="$VAR"}` substitution does NOT —
 # that gets word-split before the assignment is recognised.
 VMPROXY_LINUX_RUSTFLAGS_ENV=()
 VMPROXY_BSD_RUSTFLAGS_ENV=()
-if [[ "$HOST_OS" == "Linux" ]]; then
+if [[ -n "$CROSS_CC" ]]; then
     VMPROXY_LINUX_LINKER_CFG=(
-        --config 'target.aarch64-unknown-linux-musl.linker="clang"'
+        --config "target.aarch64-unknown-linux-musl.linker=\"$CROSS_CC\""
     )
     VMPROXY_BSD_LINKER_CFG=(
-        --config 'target.aarch64-unknown-freebsd.linker="clang"'
+        --config "target.aarch64-unknown-freebsd.linker=\"$CROSS_CC\""
     )
     VMPROXY_LINUX_RUSTFLAGS_ENV=(
         env "RUSTFLAGS=-Clink-arg=--target=aarch64-unknown-linux-musl -Clink-arg=-fuse-ld=lld"

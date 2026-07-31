@@ -20,6 +20,14 @@
             # ships its own musl headers and libc, so this replaces the
             # Homebrew-clang + Debian-sysroot path in ./cc_linux entirely.
             pkgs.zig
+            # `-fuse-ld=lld` in the guest cross builds; clang looks for ld.lld
+            # on PATH. clang itself is referenced by absolute path below so it
+            # does not shadow the host toolchain for the macOS build.
+            pkgs.lld
+            # The Go builds stamp VCS info. /usr/bin/git is an Xcode stub that
+            # dispatches via xcrun, which nixpkgs' xcbuild shadows in this
+            # shell, so a real git has to be on PATH ahead of it.
+            pkgs.git
             # Integration tests.
             pkgs.bats
           ];
@@ -31,6 +39,10 @@
             # not marked `force` and so loses to the ambient environment.
             CC_LINUX = "zig cc -target aarch64-linux-musl";
             PKG_CONFIG_PATH = "${pkgs.util-linux.dev}/lib/pkgconfig";
+            # Cross-links vmproxy for the Linux and FreeBSD guests, replacing
+            # the Homebrew LLVM path pinned in vmproxy/.cargo/config.toml.
+            # Consumed by ./build-app.sh.
+            ANYLINUXFS_CROSS_CC = "${pkgs.llvmPackages.clang}/bin/clang";
           };
 
           # Rust deliberately comes from the ambient rustup toolchain rather

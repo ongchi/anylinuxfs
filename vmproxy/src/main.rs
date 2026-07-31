@@ -583,14 +583,14 @@ fn export_args_for_path(
     export_mode: &str,
     _fsid: usize,
     export_args_override: Option<&str>,
-    allow_insecure_ports: bool,
+    _allow_insecure_ports: bool,
 ) -> anyhow::Result<String> {
     #[cfg(target_os = "linux")]
     let mut export_args = if let Some(override_args) = export_args_override {
         override_args.to_owned()
     } else {
         let base = format!("{export_mode},no_subtree_check,no_root_squash");
-        match allow_insecure_ports {
+        match _allow_insecure_ports {
             true => format!("{base},insecure"),
             false => base,
         }
