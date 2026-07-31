@@ -48,6 +48,10 @@ brew install anylinuxfs
   the `vmnet` helper it is restricted to the host's own address — which every local program shares. Since
   exports use `no_root_squash`, any such program gets root-equivalent access to the mounted disk. Treat a
   mounted volume as readable and writable by anything running on the machine.
+- With the FreeBSD guest (used for ZFS), the VM's control channel is a plain TCP listener inside the VM and
+  is not authenticated, so any local process that can reach the VM can shut it down — forcing an unmount —
+  or read its kernel log. The Linux guest is unaffected: it uses vsock instead. FreeBSD has no `AF_VSOCK`,
+  so the two guests cannot share one transport.
 
 ## Known issues
 - Some disks with non-ASCII labels might fail to mount unless a custom mount point with "safe" characters is used (this is a macOS bug)

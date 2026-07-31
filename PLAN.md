@@ -287,6 +287,25 @@ reachable by arbitrary local processes (vsock rather than IP), packet filtering
 on the vmnet address, or giving up `no_root_squash` — which would defeat the
 tool's purpose. Documented in README's Limitations instead.
 
+## Accepted risk: unauthenticated control channel on the FreeBSD guest
+
+`vmproxy/src/main.rs` binds the control listener to `0.0.0.0:7350` on the
+FreeBSD/macOS target. The protocol is unauthenticated and `vmctrl::Request` is
+`Quit | SubscribeEvents`, so any local process that can reach the VM can force
+an unmount or read the kernel log. The Linux guest is unaffected — it uses
+vsock.
+
+Moving FreeBSD to vsock was considered and is **not possible**: FreeBSD 14.3 has
+no `AF_VSOCK` (its `sys/socket.h` ends at `AF_HYPERV` 43, `AF_MAX` 44, and the
+sysroot contains no vsock files at all), which is why `vmproxy/Cargo.toml` gates
+the `vsock` crate to `cfg(target_os = "linux")`.
+
+The remaining option was a per-VM shared secret in the `vmctrl` handshake.
+Decision (2026-07-31): **skip it.** The exposure is limited to the FreeBSD
+guest, which only the ZFS path uses, and the fix could not be tested on that
+path here. Documented in README's Limitations instead. Revisit if the FreeBSD
+guest becomes a default rather than a ZFS-only option.
+
 ## Deferred: auto-created mount points leak on failed mounts
 
 Not a security issue and pre-existing, but it makes failed mounts pile up
