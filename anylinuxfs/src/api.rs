@@ -52,6 +52,16 @@ impl UnixHandler {
     fn serve(runtime_info: Arc<Mutex<RuntimeInfo>>, socket_path: &Path) -> anyhow::Result<()> {
         let listener = UnixListener::bind(socket_path).context("Failed to bind to Unix socket")?;
 
+        // Connecting to a Unix socket needs write permission on it, and bind()
+        // takes its mode from the ambient umask. Set 0600 explicitly so the
+        // socket is not connectable by other local users if the process happens
+        // to run under a permissive umask; it serves the mount configuration.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+                .context("Failed to restrict Unix socket permissions")?;
+        }
+
         {
             let rt_info = runtime_info.lock().unwrap();
             privilege::chown_to_invoker(

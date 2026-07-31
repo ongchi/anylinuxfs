@@ -339,19 +339,30 @@ pub(crate) fn prepare_key_file_for_vm(
             // The VM sees it as /.alfs_keyfile via virtiofs.
             let keyfile_name = format!(".alfs_keyfile-{}", rand_string(8));
             let dst = config.paths.root_path.join(&keyfile_name);
-            fs::copy(key_file_host_path, &dst)
-                .with_context(|| format!("Failed to copy key file to rootfs: {}", dst.display()))?;
+            // Create the destination 0600 before writing the key into it.
+            // fs::copy would give it the *source* file's mode, leaving the key
+            // readable by other local users until the chmod that followed.
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut src = File::open(key_file_host_path)
+                    .with_context(|| format!("Failed to open key file {key_file_host_path:?}"))?;
+                let mut dst_file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&dst)
+                    .with_context(|| {
+                        format!("Failed to create key file in rootfs: {}", dst.display())
+                    })?;
+                io::copy(&mut src, &mut dst_file).with_context(|| {
+                    format!("Failed to copy key file to rootfs: {}", dst.display())
+                })?;
+            }
             privilege::chown_to_invoker(
                 &dst,
                 config.privilege.invoker_uid,
                 config.privilege.invoker_gid,
             )?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&dst, fs::Permissions::from_mode(0o600))
-                    .context("Failed to set permissions on key file in rootfs")?;
-            }
             xattr_util::set_override_stat_file(&dst, 0, 0, 0o600)?;
             // Register cleanup in the parent's Deferred — runs after the child exits.
 
@@ -373,7 +384,18 @@ pub(crate) fn prepare_key_file_for_vm(
             // Pack the key file into an ISO image; the ISO is attached as a read-only
             // disk to the VM. The child inherits the open fd via fork.
             let tmp_dir = PathBuf::from("/tmp").join(format!("alfs-kf-{}", rand_string(8)));
-            fs::create_dir_all(&tmp_dir).context("Failed to create key file temp directory")?;
+            // 0700, not create_dir_all's 0755: the staged key file and the ISO
+            // built from it both live here, and /tmp is world-traversable. The
+            // ISO is only chmod'ed after create_iso returns, so without this the
+            // key is briefly readable by any local user.
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(&tmp_dir)
+                    .context("Failed to create key file temp directory")?;
+            }
 
             let iso_keyfile_name = "keyfile";
             let key_dst = tmp_dir.join(iso_keyfile_name);
