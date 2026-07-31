@@ -20,7 +20,6 @@ use std::fs;
 use std::io::{self, Read, Write};
 #[cfg(any(target_os = "freebsd", target_os = "macos"))]
 use std::net::TcpListener;
-use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -525,43 +524,6 @@ fn statfs(path: impl AsRef<Path>) -> io::Result<libc::statfs> {
     Ok(buf)
 }
 
-/// The host's address as seen from inside the VM.
-///
-/// Mirrors the gateway derivation in `init_network`: under vmnet the host holds
-/// the first host address of the native network, and under gvproxy/TSI it is the
-/// fixed `VM_GATEWAY_IP`.
-fn host_peer_ip(native_network: Option<Ipv4Net>) -> anyhow::Result<Ipv4Addr> {
-    match native_network.and_then(|net| net.hosts().next()) {
-        Some(addr) => Ok(addr),
-        None => VM_GATEWAY_IP
-            .parse()
-            .context("Failed to parse VM_GATEWAY_IP"),
-    }
-}
-
-/// Which peer the NFS exports should be restricted to.
-///
-/// Normally this is just the host. When the user asked for the share to be
-/// reachable off-box (`--bind-addr` with a non-loopback address) the clients are
-/// arbitrary remote machines, so the export has to stay open — the host warns
-/// about that separately.
-fn nfs_export_peer(
-    bind_addrs: &[String],
-    native_network: Option<Ipv4Net>,
-) -> anyhow::Result<String> {
-    let shared_volume = bind_addrs.iter().any(|addr| {
-        addr.parse::<IpAddr>()
-            .map(|addr| !addr.is_loopback())
-            .unwrap_or(false)
-    });
-
-    if shared_volume {
-        return Ok("*".to_owned());
-    }
-
-    Ok(host_peer_ip(native_network)?.to_string())
-}
-
 /// Reject export paths that can't safely be written to a line-based exports
 /// file. The paths come from the mounted filesystem (ZFS dataset mountpoints),
 /// so a crafted pool could otherwise append arbitrary export entries.
@@ -583,17 +545,16 @@ fn export_args_for_path(
     export_mode: &str,
     _fsid: usize,
     export_args_override: Option<&str>,
-    _allow_insecure_ports: bool,
 ) -> anyhow::Result<String> {
+    // `insecure` (allow unprivileged source ports) is required: gvproxy re-dials
+    // forwarded connections from its own netstack, so nfsd never sees the macOS
+    // client's reserved port. Verified by mounting without it, which fails with
+    // "Operation not permitted".
     #[cfg(target_os = "linux")]
     let mut export_args = if let Some(override_args) = export_args_override {
         override_args.to_owned()
     } else {
-        let base = format!("{export_mode},no_subtree_check,no_root_squash");
-        match _allow_insecure_ports {
-            true => format!("{base},insecure"),
-            false => base,
-        }
+        format!("{export_mode},no_subtree_check,no_root_squash,insecure")
     };
     #[cfg(any(target_os = "freebsd", target_os = "macos"))]
     let export_args = if let Some(override_args) = export_args_override {
@@ -1103,8 +1064,6 @@ impl VmDiskContext {
         export_paths: Vec<String>,
         export_mode: &str,
         effective_export_args_override: Option<&str>,
-        export_peer: &str,
-        allow_insecure_ports: bool,
     ) -> anyhow::Result<()> {
         let all_exports = if self.is_zfs {
             let mut paths: BTreeSet<_> = self
@@ -1119,13 +1078,7 @@ impl VmDiskContext {
 
             let mut exports = vec![];
             for (i, p) in paths.into_iter().enumerate() {
-                let a = export_args_for_path(
-                    &p,
-                    export_mode,
-                    i,
-                    effective_export_args_override,
-                    allow_insecure_ports,
-                )?;
+                let a = export_args_for_path(&p, export_mode, i, effective_export_args_override)?;
                 exports.push((p, a));
             }
             exports
@@ -1133,13 +1086,8 @@ impl VmDiskContext {
             let mut exports = vec![];
             let paths: BTreeSet<_> = export_paths.into_iter().collect();
             for (i, path) in paths.into_iter().enumerate() {
-                let args = export_args_for_path(
-                    &path,
-                    export_mode,
-                    i,
-                    effective_export_args_override,
-                    allow_insecure_ports,
-                )?;
+                let args =
+                    export_args_for_path(&path, export_mode, i, effective_export_args_override)?;
                 exports.push((path, args));
             }
             exports
@@ -1152,23 +1100,18 @@ impl VmDiskContext {
                 continue;
             }
             println!("<anylinuxfs-nfs-export:{}>", export_path);
+            // The peer is deliberately left open. Restricting it to the host's
+            // address broke mounting under both network helpers: the source
+            // address nfsd observes is not the gateway address the guest routes
+            // through. Until that address is established on the host side and
+            // passed in, a wildcard is the only value known to work. See PLAN.md.
             #[cfg(target_os = "linux")]
             {
-                exports_content += &format!(
-                    "\"{}\"      {}({})\n",
-                    export_path, export_peer, export_args
-                );
+                exports_content += &format!("\"{}\"      *({})\n", export_path, export_args);
             }
             #[cfg(any(target_os = "freebsd", target_os = "macos"))]
             {
-                // A bare peer is a host entry; the wildcard has to stay in
-                // -network form, which is what the shared-volume case wants.
-                let peer_spec = if export_peer == "*" {
-                    ",network 0.0.0.0/0".to_owned()
-                } else {
-                    format!(" {export_peer}")
-                };
-                exports_content += &format!("{} {}{}\n", export_path, export_args, peer_spec);
+                exports_content += &format!("{} {},network 0.0.0.0/0\n", export_path, export_args);
             }
         }
 
@@ -1407,34 +1350,16 @@ fn run() -> anyhow::Result<()> {
 
     let export_mode = if effective_read_only { "ro" } else { "rw" };
 
-    // gvproxy re-dials forwarded connections from inside its own netstack, so
-    // nfsd sees an ephemeral source port and rejects the mount unless
-    // unprivileged ports are allowed. vmnet is a real L2 network where the
-    // macOS client keeps its reserved port, so the option can be dropped there.
-    let allow_insecure_ports = cli.native_network.is_none();
-
     let squash_opts_storage;
     let effective_export_args_override = if ignore_permissions && export_args_override.is_none() {
-        let base = format!("{export_mode},no_subtree_check,all_squash,anonuid=0,anongid=0");
-        squash_opts_storage = match allow_insecure_ports {
-            true => format!("{base},insecure"),
-            false => base,
-        };
+        squash_opts_storage =
+            format!("{export_mode},no_subtree_check,all_squash,anonuid=0,anongid=0,insecure");
         Some(squash_opts_storage.as_str())
     } else {
         export_args_override
     };
 
-    let export_peer = nfs_export_peer(&cli.bind_addrs, cli.native_network)?;
-    println!("NFS export peer: {export_peer} (insecure ports: {allow_insecure_ports})");
-
-    dsk.build_nfs_exports(
-        export_paths,
-        export_mode,
-        effective_export_args_override,
-        &export_peer,
-        allow_insecure_ports,
-    )?;
+    dsk.build_nfs_exports(export_paths, export_mode, effective_export_args_override)?;
 
     match Command::new("/usr/local/bin/entrypoint.sh").spawn() {
         Ok(mut hnd) => {
@@ -1454,38 +1379,8 @@ fn run() -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-mod export_peer_tests {
+mod export_path_tests {
     use super::*;
-
-    fn net(s: &str) -> Option<Ipv4Net> {
-        Some(s.parse().unwrap())
-    }
-
-    #[test]
-    fn test_peer_defaults_to_vm_gateway_without_native_network() {
-        assert_eq!(nfs_export_peer(&[], None).unwrap(), VM_GATEWAY_IP);
-    }
-
-    #[test]
-    fn test_peer_is_first_host_of_native_network() {
-        // vmnet hands out a /30: .1 is the host, .2 is the VM.
-        assert_eq!(
-            nfs_export_peer(&[], net("192.168.140.0/30")).unwrap(),
-            "192.168.140.1"
-        );
-    }
-
-    #[test]
-    fn test_loopback_bind_addrs_do_not_widen_the_peer() {
-        let addrs = vec!["127.0.0.1".to_owned(), "127.0.0.44".to_owned()];
-        assert_eq!(nfs_export_peer(&addrs, None).unwrap(), VM_GATEWAY_IP);
-    }
-
-    #[test]
-    fn test_non_loopback_bind_addr_opens_the_export() {
-        let addrs = vec!["127.0.0.1".to_owned(), "192.168.1.50".to_owned()];
-        assert_eq!(nfs_export_peer(&addrs, None).unwrap(), "*");
-    }
 
     #[test]
     fn test_validate_export_path_accepts_ordinary_mountpoints() {
