@@ -2,14 +2,42 @@
   description = "anylinuxfs development shell (macOS host toolchain)";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+  # nixpkgs' rustc only ships std for the host. vmproxy is cross-compiled to
+  # aarch64-unknown-linux-musl for the guest, which needs a toolchain carrying
+  # that target's std.
+  inputs.rust-overlay.url = "github:oxalica/rust-overlay";
+  inputs.rust-overlay.inputs.nixpkgs.follows = "nixpkgs";
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, rust-overlay }:
     let
       systems = [ "aarch64-darwin" "x86_64-darwin" ];
       forAllSystems = f:
-        nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+        nixpkgs.lib.genAttrs systems (system: f (import nixpkgs {
+          inherit system;
+          overlays = [ rust-overlay.overlays.default ];
+        }));
     in
     {
+      packages = forAllSystems (
+        pkgs:
+        let
+          vmrunner-sys = pkgs.callPackage ./nix/vmrunner-sys.nix { };
+          goTools = pkgs.callPackage ./nix/go-tools.nix { inherit vmrunner-sys; };
+          artifacts = pkgs.callPackage ./nix/artifacts.nix { };
+          anylinuxfs-bin = pkgs.callPackage ./nix/package.nix { };
+          vmproxy = pkgs.callPackage ./nix/vmproxy.nix { };
+        in
+        rec {
+          anylinuxfs = pkgs.callPackage ./nix/assemble.nix {
+            inherit anylinuxfs-bin vmproxy vmrunner-sys artifacts;
+            inherit (goTools) init-rootfs;
+          };
+          inherit anylinuxfs-bin vmproxy vmrunner-sys;
+          inherit (goTools) init-rootfs;
+          default = anylinuxfs;
+        }
+      );
+
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           packages = [

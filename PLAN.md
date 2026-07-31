@@ -1,3 +1,71 @@
+# PLAN — nix package output for anylinuxfs
+
+Goal: `packages.aarch64-darwin.anylinuxfs` in this flake, so it can be consumed
+as an input by a nix-darwin configuration.
+
+De-risked already: **codesigning works inside the nix sandbox.**
+`darwin.sigtool` + `cctools` (the latter supplies `codesign_allocate`, without
+which sigtool aborts) signs with `--entitlements`, and readback confirms
+`com.apple.security.hypervisor` is embedded. Ad-hoc signatures survive being
+copied, which `install.sh` already relies on.
+
+Install layout, from `settings.rs` (`prefix_dir` = parent of the exec dir) and
+`init-rootfs/main.go`:
+
+    $out/bin/anylinuxfs
+    $out/libexec/{vmproxy,init-rootfs,gvproxy,vmnet-helper,init-freebsd,Image,Image-4K}
+    $out/lib/modules.squashfs
+    $out/etc/anylinuxfs.toml
+
+## Steps
+
+1. **Fetched artifacts** → `fetchurl` × 5, reusing the SHA-256 values already
+   pinned in `download-dependencies.sh`. No hash discovery needed.
+   → verify: hashes match, no fixed-output mismatch.
+
+2. **anylinuxfs** (aarch64-darwin) via `rustPlatform.buildRustPackage`,
+   `cargoLock.lockFile` + `outputHashes` for the one git dependency
+   (`dns-sd`). Needs `pkg-config` + `util-linux` for libblkid, and
+   `CC_LINUX="zig cc -target aarch64-linux-musl"` for krun-init-blob's build.rs.
+   → verify: binary runs, `--version` works.
+
+3. **vmproxy** cross-compiled to `aarch64-unknown-linux-musl`. `cargoBuildHook`
+   forces `--target <host>`, so this needs a custom buildPhase, and plain
+   `RUSTFLAGS` to replace the per-target rustflags (dropping
+   `-Clinker-plugin-lto`, which needs rustc's LLVM to match clang's).
+   → verify: `file` reports a static aarch64 Linux ELF.
+
+4. **init-rootfs** and **freebsd-bootstrap** via `buildGoModule`, each needing a
+   `vendorHash`.
+   → verify: both binaries produced; freebsd-bootstrap is a FreeBSD arm64 ELF.
+
+5. **Assemble + sign**: lay out the tree above, then codesign `bin/anylinuxfs`
+   and `libexec/init-rootfs` with `anylinuxfs.entitlements`.
+   → verify: `codesign -d --entitlements -` shows the hypervisor entitlement on
+   both.
+
+6. **Wire into nix-darwin**: add the input to `/etc/nix-darwin/flake.nix` and an
+   overlay, following the existing (commented) `pflotran7` pattern.
+   → verify: `darwin-rebuild build --flake .#Woodoo` evaluates.
+
+## Cost and risks
+
+Steps 2 and 4 need **hash discovery**: build, read the mismatch error, record
+the hash, rebuild. That is three unknown hashes (one cargo git dep, two Go
+vendor hashes) and several full builds, so this is iterative rather than
+one-shot.
+
+`vmproxy-bsd` (FreeBSD guest) is **out of scope**: it needs a pinned nightly
+toolchain, `-Z build-std`, and a FreeBSD sysroot fetched at build time. Its
+absence disables ZFS-via-FreeBSD; the Linux guest path is unaffected.
+
+Not yet checked: whether the `krun` crates vendor cleanly, and whether
+`libkrun.dylib` needs an `install_name_tool` fixup in the store (`install.sh`
+has that code, currently commented out as "not needed when using libkrun from
+homebrew" — which no longer applies here).
+
+---
+
 # PLAN — Security fixes #1 and #2
 
 Scope: the two highest-severity findings from the audit. Findings #3 (lock file),
