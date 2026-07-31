@@ -43,6 +43,12 @@ brew install anylinuxfs
   That means you can only mount multiple logical volumes from the same partition if you mount all of them read-only.
 - By design, any mounted volume is seen by macOS as a network drive shared by our virtual machine.
 - Microsoft Word cannot edit files directly on a mounted drive. This is a known issue with Word and network filesystems.
+- With the default `gvproxy` network helper, the NFS share is reachable by **any local process**, not just
+  the mounting user. gvproxy re-dials forwarded connections from inside its own network stack, so the export
+  has to accept unprivileged source ports and cannot tell a legitimate client apart from any other local
+  program. Since exports are mounted with `no_root_squash`, such a program gets root-equivalent access to the
+  disk. Use `--net-helper vmnet` (a real network, no port forwarding) if this matters to you; there the export
+  is restricted to the host's address and reserved ports are required.
 
 ## Known issues
 - Some disks with non-ASCII labels might fail to mount unless a custom mount point with "safe" characters is used (this is a macOS bug)

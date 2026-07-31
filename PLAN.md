@@ -194,7 +194,29 @@ rather than a malformed exports file; `--bind-addr` on a LAN IP prints the warni
 - Fix #2 step 2.3 (`insecure`): **open**, blocked on a probe that needs an
   interactive sudo password. See below.
 
-### Open question for step 2.3
+### Step 2.3 resolved (2026-07-31)
+
+Probe run on the pre-change binary: mounting with
+`--nfs-export-opts 'rw,no_subtree_check,no_root_squash'` (the default minus
+`insecure`) fails with `mount_nfs: ... Operation not permitted`. That is nfsd
+rejecting a non-reserved source port, which confirms the hypothesis below:
+gvproxy re-dials forwarded connections from its own netstack with an ephemeral
+port.
+
+Consequences, now implemented:
+
+- `insecure` is kept under gvproxy (it is required) and dropped under vmnet,
+  keyed off `native_network` being present. Same for the `ignore_permissions`
+  squash options, which hardcoded `insecure` too.
+- Under gvproxy, peer restriction **cannot** distinguish a local unprivileged
+  process from the legitimate client, because both are NAT'd to the gateway
+  address. That limitation is real, unfixable via export options, and is now
+  documented in README's Limitations with `--net-helper vmnet` as the remedy.
+- Under vmnet the combination (peer restricted to the host + reserved ports
+  required) does close the hole. **Not yet verified on hardware** — needs a
+  mount with `--net-helper vmnet`.
+
+### Original hypothesis for step 2.3
 
 Under gvproxy the guest asks the host to forward `{bind_addr}:2049` to
 `{VM_IP}:2049` (`vmproxy/src/main.rs`, `init_network`). gvproxy accepts on the

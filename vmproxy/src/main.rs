@@ -583,12 +583,17 @@ fn export_args_for_path(
     export_mode: &str,
     _fsid: usize,
     export_args_override: Option<&str>,
+    allow_insecure_ports: bool,
 ) -> anyhow::Result<String> {
     #[cfg(target_os = "linux")]
     let mut export_args = if let Some(override_args) = export_args_override {
         override_args.to_owned()
     } else {
-        format!("{export_mode},no_subtree_check,no_root_squash,insecure")
+        let base = format!("{export_mode},no_subtree_check,no_root_squash");
+        match allow_insecure_ports {
+            true => format!("{base},insecure"),
+            false => base,
+        }
     };
     #[cfg(any(target_os = "freebsd", target_os = "macos"))]
     let export_args = if let Some(override_args) = export_args_override {
@@ -1099,6 +1104,7 @@ impl VmDiskContext {
         export_mode: &str,
         effective_export_args_override: Option<&str>,
         export_peer: &str,
+        allow_insecure_ports: bool,
     ) -> anyhow::Result<()> {
         let all_exports = if self.is_zfs {
             let mut paths: BTreeSet<_> = self
@@ -1113,7 +1119,13 @@ impl VmDiskContext {
 
             let mut exports = vec![];
             for (i, p) in paths.into_iter().enumerate() {
-                let a = export_args_for_path(&p, export_mode, i, effective_export_args_override)?;
+                let a = export_args_for_path(
+                    &p,
+                    export_mode,
+                    i,
+                    effective_export_args_override,
+                    allow_insecure_ports,
+                )?;
                 exports.push((p, a));
             }
             exports
@@ -1121,8 +1133,13 @@ impl VmDiskContext {
             let mut exports = vec![];
             let paths: BTreeSet<_> = export_paths.into_iter().collect();
             for (i, path) in paths.into_iter().enumerate() {
-                let args =
-                    export_args_for_path(&path, export_mode, i, effective_export_args_override)?;
+                let args = export_args_for_path(
+                    &path,
+                    export_mode,
+                    i,
+                    effective_export_args_override,
+                    allow_insecure_ports,
+                )?;
                 exports.push((path, args));
             }
             exports
@@ -1390,23 +1407,33 @@ fn run() -> anyhow::Result<()> {
 
     let export_mode = if effective_read_only { "ro" } else { "rw" };
 
+    // gvproxy re-dials forwarded connections from inside its own netstack, so
+    // nfsd sees an ephemeral source port and rejects the mount unless
+    // unprivileged ports are allowed. vmnet is a real L2 network where the
+    // macOS client keeps its reserved port, so the option can be dropped there.
+    let allow_insecure_ports = cli.native_network.is_none();
+
     let squash_opts_storage;
     let effective_export_args_override = if ignore_permissions && export_args_override.is_none() {
-        squash_opts_storage =
-            format!("{export_mode},no_subtree_check,all_squash,anonuid=0,anongid=0,insecure");
+        let base = format!("{export_mode},no_subtree_check,all_squash,anonuid=0,anongid=0");
+        squash_opts_storage = match allow_insecure_ports {
+            true => format!("{base},insecure"),
+            false => base,
+        };
         Some(squash_opts_storage.as_str())
     } else {
         export_args_override
     };
 
     let export_peer = nfs_export_peer(&cli.bind_addrs, cli.native_network)?;
-    println!("NFS export peer: {export_peer}");
+    println!("NFS export peer: {export_peer} (insecure ports: {allow_insecure_ports})");
 
     dsk.build_nfs_exports(
         export_paths,
         export_mode,
         effective_export_args_override,
         &export_peer,
+        allow_insecure_ports,
     )?;
 
     match Command::new("/usr/local/bin/entrypoint.sh").spawn() {
