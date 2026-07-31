@@ -260,8 +260,32 @@ pointless there.
 `--nfs-export-peer` is also exposed on the host CLI, so alternative values can
 be tried without a rebuild; `--nfs-export-peer '*'` opts out entirely.
 
-**Unverified on hardware.** Needs a mount with `--net-helper vmnet`; the guest
-log line `NFS export peer: <value>` reports what was applied.
+Verified on hardware: the lookup finds `172.27.1.1` (the host's address on the
+vmnet `/30`) and the restriction is applied.
+
+### Correction to the step 2.3 conclusion
+
+The vmnet failure attributed to the peer in commit `77ef149` was not caused by
+the peer. That commit computed the vmnet peer as `native_network.hosts().next()`
+— `172.27.1.1`, the same value the interface lookup now returns. The failure came
+from the other half of the commit: dropping `insecure`.
+
+So `insecure` is required under **both** helpers, not just gvproxy. macOS does not
+present a reserved source port even over vmnet, where there is no forwarding.
+`insecure` is now unconditional again.
+
+### Residual exposure (finding #2 is not closed)
+
+With the peer pinned to `172.27.1.1`, the export excludes other hosts but *not*
+other processes on the Mac: a local program connecting to the guest's port 2049
+over the vmnet interface presents that same source address. Combined with
+`no_root_squash` and mandatory `insecure`, any local process still gets
+root-equivalent access to the mounted disk.
+
+This cannot be closed with export options. It would need either a transport not
+reachable by arbitrary local processes (vsock rather than IP), packet filtering
+on the vmnet address, or giving up `no_root_squash` — which would defeat the
+tool's purpose. Documented in README's Limitations instead.
 
 ## Deferred: auto-created mount points leak on failed mounts
 
