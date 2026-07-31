@@ -1528,28 +1528,26 @@ impl super::AppRunner {
             config.bind_addr,
             host_addr_on_vm_network,
         );
-        // Console logging is off in non-verbose runs (see above), so this has to
-        // re-enable it the way the other user-facing messages do.
-        {
-            let _log_guard = ConsoleLogGuard::enable_temporarily(verbose);
-            match config.nfs_export_peer.as_deref() {
-                Some(peer) => host_println!("Restricting NFS export to peer {}", peer),
-                // Say why, rather than leaving the absence of a message to be
-                // interpreted. An unidentified host address means the export stays
-                // open, which is easy to miss.
-                None => match net_helper_svc.vm_native_cidr {
-                    Some(cidr) => host_println!(
-                        "NFS export left open: no host address found on the VM network {} \
-                         (interfaces: {})",
-                        cidr,
-                        describe_host_addrs()
-                    ),
-                    None => host_println!(
-                        "NFS export left open: this network helper does not put the VM on its \
-                         own subnet, so the client cannot be distinguished"
-                    ),
-                },
-            }
+        // Diagnostic rather than something the user acts on per mount: console
+        // logging is off in non-verbose runs, so this reaches the log file and
+        // `-v` output only.
+        match config.nfs_export_peer.as_deref() {
+            Some(peer) => host_println!("Restricting NFS export to peer {}", peer),
+            // Say why, rather than leaving the absence of a message to be
+            // interpreted. An unidentified host address means the export stays
+            // open, which is easy to miss.
+            None => match net_helper_svc.vm_native_cidr {
+                Some(cidr) => host_println!(
+                    "NFS export left open: no host address found on the VM network {} \
+                     (interfaces: {})",
+                    cidr,
+                    describe_host_addrs()
+                ),
+                None => host_println!(
+                    "NFS export left open: this network helper does not put the VM on its \
+                     own subnet, so the client cannot be distinguished"
+                ),
+            },
         }
         let mut net_helper_proc = net_helper_svc.proc;
 
