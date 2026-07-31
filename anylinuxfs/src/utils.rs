@@ -8,7 +8,7 @@ use std::{
     mem::ManuallyDrop,
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::fs::PermissionsExt,
+        unix::fs::{OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
     process::Child,
@@ -516,28 +516,59 @@ pub struct LockFile(File);
 
 impl LockFile {
     pub fn new(file_path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        // Try to open an existing lock file first, without O_CREAT/O_TRUNC.
-        // On Linux with fs.protected_regular = 2 (Debian default), opening
-        // a regular file with O_CREAT in /tmp (sticky+world-writable) is
-        // denied unless the file owner matches the directory owner — which
-        // breaks `sudo anylinuxfs` after a non-sudo run created the lock as
-        // the invoker, and vice versa. Plain O_RDWR is exempt from that
-        // check, so we use it for the common case where the file already
-        // exists. There's no content to truncate anyway; the file is used
-        // only for flock().
-        let opened = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&file_path);
-        let file = match opened {
+        let file_path = file_path.as_ref();
+
+        // Every open here is O_NOFOLLOW. The lock lives at a fixed path in a
+        // world-writable directory, so any local user can plant a symlink
+        // there; without O_NOFOLLOW a root run would follow it, and creating
+        // with O_TRUNC would truncate whatever it pointed at.
+        //
+        // Try an existing file first, without O_CREAT/O_TRUNC. On Linux with
+        // fs.protected_regular = 2 (Debian default), opening a regular file
+        // with O_CREAT in /tmp (sticky+world-writable) is denied unless the
+        // file owner matches the directory owner — which breaks `sudo
+        // anylinuxfs` after a non-sudo run created the lock as the invoker,
+        // and vice versa. Plain O_RDWR is exempt from that check. There's no
+        // content to truncate anyway; the file is used only for flock().
+        let open_existing = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(file_path)
+        };
+
+        let file = match open_existing() {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let f = File::create(&file_path).context("Failed to create lock file")?;
-                f.set_permissions(Permissions::from_mode(0o666))
-                    .context("Failed to set file lock permissions")?;
-                f
+                // create_new is O_CREAT|O_EXCL, so a symlink planted between
+                // the two calls loses the race instead of being followed.
+                let created = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(file_path);
+
+                match created {
+                    Ok(f) => {
+                        f.set_permissions(Permissions::from_mode(0o666))
+                            .context("Failed to set file lock permissions")?;
+                        f
+                    }
+                    // Someone else created it first; use theirs.
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        open_existing().context("Failed to open lock file")?
+                    }
+                    Err(e) => return Err(e).context("Failed to create lock file"),
+                }
             }
-            Err(e) => return Err(e).context("Failed to open lock file"),
+            Err(e) => {
+                return Err(e).context(format!(
+                    "Failed to open lock file {} (a symlink at this path is refused)",
+                    file_path.display()
+                ));
+            }
         };
 
         Ok(Self(file))
@@ -1383,5 +1414,54 @@ mod tests {
             find_env_vars("${REAL} \\${FAKE}"),
             HashSet::from(["REAL".into()])
         );
+    }
+}
+
+#[cfg(test)]
+mod lock_file_tests {
+    use super::*;
+    use crate::rand_string;
+
+    fn scratch_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("anylinuxfs-test-{tag}-{}", rand_string(8)))
+    }
+
+    #[test]
+    fn test_lock_file_is_created_when_missing() {
+        let path = scratch_path("create");
+        assert!(LockFile::new(&path).is_ok());
+        assert!(path.exists());
+        _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_lock_file_reuses_existing_file() {
+        let path = scratch_path("reuse");
+        drop(LockFile::new(&path).expect("first open"));
+        assert!(LockFile::new(&path).is_ok(), "second open should succeed");
+        _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_lock_file_refuses_to_follow_a_symlink() {
+        // A local user can plant a symlink at the fixed lock path. Following it
+        // as root would truncate the target; the open must fail instead.
+        let target = scratch_path("symlink-target");
+        std::fs::write(&target, b"do not truncate me").expect("write target");
+        let link = scratch_path("symlink");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+        assert!(
+            LockFile::new(&link).is_err(),
+            "opening through a symlink must be refused"
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("target still readable"),
+            b"do not truncate me",
+            "target must be left intact"
+        );
+
+        _ = std::fs::remove_file(&link);
+        _ = std::fs::remove_file(&target);
     }
 }
