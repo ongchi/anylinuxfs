@@ -591,6 +591,26 @@ fn host_addr_on_network(cidr: Ipv4Net) -> Option<Ipv4Addr> {
         })
 }
 
+/// Host IPv4 interfaces, for diagnosing a failed `host_addr_on_network` lookup.
+fn describe_host_addrs() -> String {
+    match if_addrs::get_if_addrs() {
+        Ok(ifaces) => {
+            let mut listed: Vec<_> = ifaces
+                .into_iter()
+                .filter_map(|iface| match iface.ip() {
+                    IpAddr::V4(addr) if !addr.is_loopback() => {
+                        Some(format!("{}={}", iface.name, addr))
+                    }
+                    _ => None,
+                })
+                .collect();
+            listed.sort();
+            listed.join(", ")
+        }
+        Err(e) => format!("unavailable: {e}"),
+    }
+}
+
 /// Which peer the NFS export should be restricted to, or `None` to leave it open.
 ///
 /// Restriction is only applied when the host's address on the VM's network can
@@ -1502,13 +1522,29 @@ impl super::AppRunner {
         };
 
         vm_native_ip = net_helper_svc.vm_native_ip;
+        let host_addr_on_vm_network = net_helper_svc.vm_native_cidr.and_then(host_addr_on_network);
         config.nfs_export_peer = resolve_nfs_export_peer(
             config.nfs_export_peer.as_deref(),
             config.bind_addr,
-            net_helper_svc.vm_native_cidr.and_then(host_addr_on_network),
+            host_addr_on_vm_network,
         );
-        if let Some(peer) = config.nfs_export_peer.as_deref() {
-            host_println!("Restricting NFS export to peer {}", peer);
+        match config.nfs_export_peer.as_deref() {
+            Some(peer) => host_println!("Restricting NFS export to peer {}", peer),
+            // Say why, rather than leaving the absence of a message to be
+            // interpreted. An unidentified host address means the export stays
+            // open, which is easy to miss.
+            None => match net_helper_svc.vm_native_cidr {
+                Some(cidr) => host_println!(
+                    "NFS export left open: no host address found on the VM network {} \
+                     (interfaces: {})",
+                    cidr,
+                    describe_host_addrs()
+                ),
+                None => host_println!(
+                    "NFS export left open: this network helper does not put the VM on its own \
+                     subnet, so the client cannot be distinguished"
+                ),
+            },
         }
         let mut net_helper_proc = net_helper_svc.proc;
 
